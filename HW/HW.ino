@@ -1,5 +1,9 @@
+#include <Arduino.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+
+#include <avr/interrupt.h>
+#include <avr/io.h>
 
 #define FILLING_START_BUTTON  3
 #define START_BUTTON  5
@@ -20,21 +24,29 @@
 #define POMPA_AC1_M1 44
 #define POMPA_AC2_M2 46
 
-#define POMPA_DC_M3 32  //42
+#define POMPA_DC_M3 19 //32  //42
 #define SELENOID_S1 40
 #define UV_FILTER 38
 #define ELEKTRODA 17
 #define MOTOR_UV  42
 
+volatile int state = 0;
+#define MOTOR 46
+#define BATASVOLUME 4000      //4000mL
+
+#define KONSTAN   1.6
+
 
 #define DEBOUNCE_TIME 50
-#define TimerPompa3 12000    //mS
+#define TimerPompa3 150000    //mS
 #define LAMAELEKTRODAON 50 //7200
 #define JEDAPENGUKURANPH  5000 //mS
 
 #define flowPin 2    //This is the input pin on the Arduino
 double flowRate;    //This is the value we intend to calculate.
 volatile int count; //This integer needs to be set as volatile to ensure it updates correctly during the interrupt process.
+
+unsigned long startTime = millis();
 
 #define PROSES_PENGISIAN_AIR          "Proses Pengisian Bak"
 #define PESAN_PENGISIANTANGKIKOAGULAN "Pengisian Koagulan"
@@ -49,7 +61,7 @@ enum currentStatus {IDDLE = 0, ISITANGKIKOAGULASI, PENGUKURANAWALKOAGULASI, STAR
                    };
 enum statusAir {KOSONG = 0, PENUH};
 enum statusPompa {MULAI = 0, BERHENTI};
-char mode = PENGUKURANAWALKOAGULASI;//START;
+char mode = START;
 
 long lastTime = millis();
 
@@ -70,63 +82,53 @@ float b;
 int buf[10], bufTurb[100], temp;
 //-------------------------
 
-void setup() {
-  setPinIO();
-  lcd.init();                      // initialize the lcd
-  lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print(F("Init....."));
 
-
-
-  lcd.print(F("OK"));
-  Serial.begin(115200);
+//--------------------LCD
+void lcdClearLine(char line) {
+  // for (char i = 0; i < 20; i++) {
+  lcd.setCursor(0, line);
+  lcd.print("                    ");
+  //}
 }
 
-void loop() {
 
-  //Luar proses
-  cekLevelAirBaku();
+float bacaPH1() {
+  for (int i = 0; i < 10; i++)
+  {
+    buf[i] = analogRead(A0);
 
-  //Dalam proses
-  switch (mode) {
-    case IDDLE:
-      mode_idle();
-      break;
-    case ISITANGKIKOAGULASI:
-      mode_isiTangkiKoagulasi();
-      break;
-    case PENGUKURANAWALKOAGULASI:
-      Serial.println(F("Pengukuran produk mentah"));
-      mode_ukurPH1();
-      mode_Turbidity1();
-      delay(1000);
-      //lastMode=mode;
-      //mode = ELEKTRODAON;
-      break;
-    case ELEKTRODAON:
-      mode_elektrodaOn();
-      break;
-    case PENGUKURANAKHIRKOAGULASI:
-      Serial.println(F("Pengukuran produk setelah koagulasi"));
-      mode_ukurPH2();
-      mode_Turbidity2();
-      //lastMode=mode;
-      delay(JEDAPENGUKURANPH);
-      mode = PROSESFILTRASI;
-      break;
-    case PROSESFILTRASI:
-      mode_prosesFiltrasi();
-      break;
-    case UKURPHPRODUK:
-      mode_ukurPHProduk();
-      break;
-    case START:
-      mode_start();
-      break;
-    default:
-      break;
+    delay(10);
   }
+
+  avgValue = 0;
+  for (int i = 2; i < 8; i++)
+    avgValue += buf[i];
+  float pHVol = (float)avgValue * 5.0 / 1024 / 6;
+
+  float phValue = -5.70 * pHVol + 21.34;
+
+  return (phValue);
+}
+
+int bacaTurb1() {
+  for (int i = 0; i < 100; i++)
+  {
+    bufTurb[i] = analogRead(A2);
+    delay(10);
+  }
+
+  avgValue = 0;
+  for (int i = 0; i < 1; i++)
+    avgValue += bufTurb[i];
+  float turbVol = (float)avgValue * 5.0 / 1024 / 1;
+
+  //y=ax2 + bx + c
+  Serial.println(avgValue);
+  Serial.println(turbVol);
+  float turbValue = -1120.4 * square(turbVol) + 5742.3 * turbVol - 4352.8;
+  if (turbVol < 2.5) turbValue = 3000;
+
+  return ((int)turbValue);
 }
 
 
@@ -137,7 +139,6 @@ void mode_start() {
   lcd.print(F(JUDUL));
   mode = IDDLE;
   Serial.println(F(JUDUL));
-  
 }
 
 bool tampil = false;
@@ -159,9 +160,15 @@ void mode_idle() {
 
   lastMode = mode;
 
+  digitalWrite(SENSOR_DOWN_LEVEL_PRODUCT,HIGH);
   if (!digitalRead(SENSOR_DOWN_LEVEL_PRODUCT)) {
+      lcd.setCursor(0, 3);
+      lcd.print(F("Produk Terisi Air"));
+      delay(500);
     return;
-  }
+  }else{
+    lcdClearLine(3);
+    }
 
   //tunggu START ditekan
   digitalWrite(START_BUTTON, HIGH);
@@ -189,11 +196,15 @@ void mode_isiTangkiKoagulasi() {
     Serial.println(F("POMPA_AC2_M2 ON"));
     digitalWrite(POMPA_DC_M3, LOW);
     Serial.println(F("POMPA_DC_M3 ON"));
-    interrupts();   //Enables interrupts on the Arduino
 
     //aktifkan timer flowrate
     flowRatelastTime = millis();
+    EIMSK = 0x10;          //Enable only INT4
+
     volTangkiKoagulasi = 0;
+    lcd.setCursor(0, 1);
+    lcd.print(F("Tangki Koagulasi:"));
+
   }
 
   long curTime = millis();
@@ -207,27 +218,19 @@ void mode_isiTangkiKoagulasi() {
 
   //ukur flow sensor INT2
   if (curTime - flowRatelastTime > 1000 && volTangkiKoagulasi < 380) {
-    noInterrupts();
     flowRatelastTime = curTime;
 
+    EIMSK = 0x00;          //Disable only INT4
+    volTangkiKoagulasi += (state * KONSTAN);
+    EIMSK = 0x10;          //Enable only INT4
+    state = 0;
+    Serial.println(volTangkiKoagulasi);
 
-    
-    flowRate = (count * 2.25);        //Take counted pulses in the last second and multiply by 2.25L
-    count = 0;
-    //volTangkiKoagulasi += flowRate;   //total Volume 1 sampling per detik
-    //dummy, tutup baris dibawah kalau sudah dipasang pompanya
-
-    
-    volTangkiKoagulasi += 50;
-
-    interrupts();   //Enables interrupts on the Arduino wait for 1000ms
-    lcd.setCursor(0, 1);
-    lcd.print(F("Tangki Koagulasi:"));
     if (TangkiKoagulasi == KOSONG) {
       lcdClearLine(2);
       lcd.setCursor(0, 2);
       lcd.print(volTangkiKoagulasi);
-      lcd.print(F(" L"));
+      lcd.print(F(" mL"));
     }
 
   }
@@ -242,6 +245,7 @@ void mode_isiTangkiKoagulasi() {
     TangkiKoagulasi = PENUH;
   }
 
+  digitalWrite(SENSOR_LEVEL2,HIGH);
   if (!digitalRead(SENSOR_LEVEL2)) {
     delay(DEBOUNCE_TIME);
     if (!digitalRead(SENSOR_LEVEL2)) {
@@ -395,7 +399,7 @@ void mode_prosesFiltrasi() {
 
     //Selenoid dibuka
     Serial.println(F("Proses pengisian bak filtrasi"));
-    digitalWrite(SELENOID_S1, LOW);
+    digitalWrite(SELENOID_S1, HIGH);
     Serial.println(F("SELENOID_S1 ON"));
 
     Serial.println(F("Filter UV dialirkan"));
@@ -410,9 +414,10 @@ void mode_prosesFiltrasi() {
 
   ///----Bagian Selenoid---
   //Matikan selenoid jika tampungan penuh
+  digitalWrite(SENSOR_UP_LEVEL,HIGH);
   if (!digitalRead(SENSOR_UP_LEVEL) && tangkiFiltrasi == KOSONG) {
     Serial.println(F("Tangki filtrasi penuh"));
-    digitalWrite(SELENOID_S1, HIGH);
+    digitalWrite(SELENOID_S1, LOW);
     Serial.println(F("SELENOID_S1 OFF"));
     tangkiFiltrasi = PENUH;
     flowRatelastTime = millis(); //start timer
@@ -425,7 +430,7 @@ void mode_prosesFiltrasi() {
       Serial.println(F("Pengisian ulangtangki filtrasi"));
       flowRatelastTime = curTime;
       tangkiFiltrasi = KOSONG;
-      digitalWrite(SELENOID_S1, LOW);
+      digitalWrite(SELENOID_S1, HIGH);
       Serial.println(F("SELENOID_S1 ON"));
 
 
@@ -445,11 +450,12 @@ void mode_prosesFiltrasi() {
   }
 
   //Jika tidak ada air dan pengisian sudah selesai matikan selenoid dan pompa UV
+  digitalWrite(SENSOR_DOWN_LEVEL,HIGH);
   if (tangkiFiltrasi == KOSONG && !digitalRead(SENSOR_DOWN_LEVEL)) {
     Serial.println(F("Tangki filter telah kosong, matikan motor UV, UV dan Selenoid"));
     digitalWrite(MOTOR_UV, HIGH);
     Serial.println(F("MOTOR_UV OFF"));
-    pinMode(SELENOID_S1, HIGH);
+    pinMode(SELENOID_S1, LOW);
     Serial.println(F("SELENOID_S1 OFF"));
     digitalWrite(UV_FILTER, HIGH);
     Serial.println(F("UV_FILTER OFF"));
@@ -481,19 +487,19 @@ void setPinIO() {
   digitalWrite( POMPA_AC1_M1, LOW);
   digitalWrite( POMPA_AC2_M2, LOW);
   digitalWrite( POMPA_DC_M3, HIGH);
-  digitalWrite( SELENOID_S1, HIGH);
+  digitalWrite( SELENOID_S1, LOW);
   digitalWrite( UV_FILTER, HIGH);
   digitalWrite(ELEKTRODA, HIGH);
   digitalWrite (MOTOR_UV, HIGH);
   digitalWrite(SENSOR_DOWN_LEVEL_PRODUCT, LOW);
 
   pinMode(flowPin, INPUT);           //Sets the pin as an input
-  attachInterrupt(2, Flow, RISING);  //Configures interrupt 0 (pin 2 on the Arduino Uno) to run the function "Flow"
 
 
 }
 
 void cekLevelAirBaku() {
+  
   digitalWrite(FILLING_START_BUTTON, HIGH);
   if (!digitalRead(FILLING_START_BUTTON)) {
     delay(DEBOUNCE_TIME);
@@ -506,14 +512,20 @@ void cekLevelAirBaku() {
     }
   }
 
+  digitalWrite(SENSOR_LEVEL1, HIGH);
   if (!digitalRead(SENSOR_LEVEL1)) {
-    digitalWrite(POMPA_AC1_M1, LOW);
-    if (bakAirBaku == KOSONG) {
-      lcdClearLine(0);
-      lcd.setCursor(0, 0);
-      lcd.print(F(PROSES_PENGISIAN_AIR_PENUH));
+    
+    if (!digitalRead(SENSOR_LEVEL1)) {
+  Serial.println(digitalRead(SENSOR_LEVEL1));
+
+      digitalWrite(POMPA_AC1_M1, LOW);
+      if (bakAirBaku == KOSONG) {
+        lcdClearLine(0);
+        lcd.setCursor(0, 0);
+        lcd.print(F(PROSES_PENGISIAN_AIR_PENUH));
+      }
+      bakAirBaku = PENUH;
     }
-    bakAirBaku = PENUH;
   }
 }
 
@@ -531,54 +543,77 @@ void mode_ukurPHProduk() {
 
 }
 
-//--------------------LCD
-void lcdClearLine(char line) {
-  // for (char i = 0; i < 20; i++) {
-  lcd.setCursor(0, line);
-  lcd.print("                    ");
-  //}
+
+
+ISR(INT4_vect) {
+  state++;
 }
 
-void Flow()
-{
-  count++; //Every time this function is called, increment "count" by 1
+void setup() {
+  setPinIO();
+  lcd.init();                      // initialize the lcd
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Init....."));
+
+
+
+  lcd.print(F("OK"));
+  lcd.setCursor(0, 0);
+  lcd.print(F("OK"));
+  lcd.setCursor(0, 0);
+  Serial.begin(115200);
+
+  pinMode(2, INPUT);     //Button input tied to INT4
+  EICRB = 0x11;          //INT4, triggered on rissing
+        lcdClearLine(0);
+        lcd.setCursor(0, 0);
+        lcd.print(F("Mulai..."));
+
 }
 
-float bacaPH1() {
-  for (int i = 0; i < 10; i++)
-  {
-    buf[i] = analogRead(A0);
-    
-    delay(10);
+void loop() {
+
+  //Luar proses
+  cekLevelAirBaku();
+
+  //Dalam proses
+  switch (mode) {
+    case IDDLE:
+      mode_idle();
+      break;
+    case ISITANGKIKOAGULASI:
+      mode_isiTangkiKoagulasi();
+      break;
+    case PENGUKURANAWALKOAGULASI:
+      Serial.println(F("Pengukuran produk mentah"));
+      mode_ukurPH1();
+      mode_Turbidity1();
+      delay(1000);
+      //lastMode=mode;
+      //mode = ELEKTRODAON;
+      break;
+    case ELEKTRODAON:
+      mode_elektrodaOn();
+      break;
+    case PENGUKURANAKHIRKOAGULASI:
+      Serial.println(F("Pengukuran produk setelah koagulasi"));
+      mode_ukurPH2();
+      mode_Turbidity2();
+      //lastMode=mode;
+      delay(JEDAPENGUKURANPH);
+      mode = PROSESFILTRASI;
+      break;
+    case PROSESFILTRASI:
+      mode_prosesFiltrasi();
+      break;
+    case UKURPHPRODUK:
+      mode_ukurPHProduk();
+      break;
+    case START:
+      mode_start();
+      break;
+    default:
+      break;
   }
-  
-  avgValue = 0;
-  for (int i = 2; i < 8; i++)
-    avgValue += buf[i];
-  float pHVol = (float)avgValue * 5.0 / 1024 / 6;
-  
-  float phValue = -5.70 * pHVol + 21.34;
-
-  return(phValue);
-}
-
-int bacaTurb1() {
-  for (int i = 0; i < 100; i++)
-  {
-    bufTurb[i] = analogRead(A2);
-    delay(10);
-  }
-  
-  avgValue = 0;
-  for (int i = 0; i < 1; i++)
-    avgValue += bufTurb[i];
-  float turbVol = (float)avgValue * 5.0 / 1024 / 1;
-
-  //y=ax2 + bx + c
-  Serial.println(avgValue);
-  Serial.println(turbVol);
-  float turbValue = -1120.4*square(turbVol)+5742.3*turbVol-4352.8;
-  if(turbVol<2.5) turbValue = 3000;
-
-  return((int)turbValue);
 }
